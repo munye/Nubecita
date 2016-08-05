@@ -1,0 +1,131 @@
+#!/bin/bash
+
+# Considerar al argumento 1 (nombre-vm) obligatorio
+if ! [ $# -eq 1 ]; then
+    echo "Uso: $0 <nombre-vm>"
+    exit 1
+fi
+
+# Chequear si ya existe
+virsh dominfo $1 > /dev/null 2>&1
+if [ "$?" -eq 0 ]; then
+    echo -n "OJO $1 ya existe.  "
+fi
+
+# Entorno
+
+WORKDIR=~/virt/images
+IMAGE=$WORKDIR/CentOS-7-x86_64-GenericCloud-1607.qcow2
+MEM=1024
+CPUS=1
+
+USER_DATA=user-data
+META_DATA=meta-data
+CI_ISO=$1-cidata.iso
+DISK=$1.qcow2
+
+#cambiar según corresponda
+REPO_ISO=$WORKDIR/CentOS-7-x86_64-Everything-1511.iso
+
+BRIDGE=virbr0
+
+rm -rf $WORKDIR/$1
+mkdir -p $WORKDIR/$1
+
+# adentro del directorio $WORKDIR
+
+pushd $WORKDIR/$1 > /dev/null
+    touch ./logs/$1.log
+
+    echo "$(date -R) Rehaciendo el dominio $1 (si existiera)..."
+
+    virsh destroy $1 >> ./$1.log 2>&1
+    virsh undefine $1 >> ./$1.log 2>&1
+
+    # cloud-init: setear hostname y ssh-key
+    
+    cat > $USER_DATA << _EOF_
+
+#cloud-config
+
+preserve_hostname: False
+hostname: $1
+fqdn: $1.nocloud
+
+# log de la vm
+output: 
+  all: ">> ./logs/cloud-init.log"
+
+# ssh
+ssh_svcname: ssh
+ssh_deletekeys: True
+ssh_genkeytypes: ['rsa', 'ecdsa']
+
+ssh_authorized_keys:
+  - ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCoIWufYfxRz8eVktI5fiaCPXBRj1BaOQaV6NdmAJ0Hpdyt3+6XD88EIjj2BAlLVeX+Maq4van303ubVNfLvMQLzxift0CFy9DM5vl4r+FcnCCfVFik/xWxgJH/0ddiZbeTJEB230P+xoSJ3Nw47Vv6GdIg2gaTxIGiR/wF84khHtWapnjAqAK5iNVxroi4CfAEQ90jA8pwyKd/6WIVrDnsKwcheSD7c9OyVmGeCXHxtBD9qQBIcsFcaOVqgCOfUneUN3I5LfdKWwcYdY9tzE6txTdVEzAABl1Vg+ogOKZ7bqhlnb/pA4QXeQDLDqKk6lnZ8mVDNyX9k9UBVOi5xK/J eze@munye
+_EOF_
+
+    echo "instance-id: $1; local-hostname: $1" > $META_DATA
+
+    echo "$(date -R) Resguardando la imágen $IMAGE..."
+    cp $IMAGE $DISK
+
+    echo "$(date -R) Creando una iso como media de cloud-config..."
+    genisoimage -output $CI_ISO -volid cidata -joliet -r $USER_DATA $META_DATA &>> $1.log
+
+    echo "$(date -R) Instalando y configurando la cloud vm..."
+    
+#    echo "virt-install --import --name $1 --ram $MEM --vcpus $CPUS --disk 
+#    $DISK,format=qcow2,bus=virtio --disk $CI_ISO,device=cdrom --network 
+#    bridge=virbr0,model=virtio --os-type=linux --os-variant=rhel7.2 --noautoconsole"
+#
+#    exit
+
+    virt-install --import --name $1 --ram $MEM --vcpus $CPUS --disk \
+    $DISK,format=qcow2,bus=virtio --disk $CI_ISO,device=cdrom \
+    --network bridge=virbr0,model=virtio --os-type=linux --os-variant=rhel7.2 --noautoconsole
+
+
+
+# Obteniendo la ip address escrutando la información del dominio
+
+    MAC=$(virsh dumpxml $1 | awk -F\' '/mac address/ {print $2}')
+    while true
+    do
+        IP=$(grep -B1 $MAC /var/lib/libvirt/dnsmasq/$BRIDGE.status | head \
+             -n 1 | awk '{print $2}' | sed -e s/\"//g -e s/,//)
+        if [ "$IP" = "" ]
+        then
+            sleep 1
+        else
+            break
+        fi
+    done
+
+    echo "$(date -R) Desmontando el ISO con la info del cloud-config..."
+
+    virsh change-media $1 hda --eject --force --live 
+    rm $USER_DATA $CI_ISO
+
+    echo "$(date -R) Montando el ISO del repo..."
+    virsh change-media $1 hda --source $REPO_ISO --insert --force 
+
+
+popd > /dev/null
+
+# Afuera del directorio $WORKDIR
+
+DO_REPOS=$(cat <<EOF
+     sudo mkdir -p /media/CentOS && sudo mount /dev/cdrom /media/CentOS -o loop &&
+     sudo yum --disablerepo=* --enablerepo=c7-media -y install httpd &&
+     sudo systemctl enable httpd && sudo systemctl start httpd && sudo ln -s /media/CentOS /var/www/html
+EOF
+)
+
+echo "$(date -R) LISTO!!!!!!. SSH a \"$1\" haciendo centos@$IP."
+sleep 3
+ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -t centos@$IP "$DO_REPOS" 
+echo "$(date -R) LISTO!!!!!!. Repo en to http://$IP/CentOS."
+
+# TODO:
+# y ssh -t centos@IP sudo "$DO_REPOS" sin tanto sudos que onda?
